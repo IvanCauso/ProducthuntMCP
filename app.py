@@ -1,55 +1,73 @@
 import os, requests
+from datetime import datetime, timedelta, timezone
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 
 PH_TOKEN = os.environ.get("PRODUCTHUNT_TOKEN")
+PH_URL = "https://api.producthunt.com/v2/api/graphql"
+HDRS = {"Authorization": f"Bearer {PH_TOKEN}", "Content-Type": "application/json"}
+
+app = FastAPI()
+
+def iso_day_bounds(day_str: str):
+    # UTC day start and next-day start (PH treats postedBefore as exclusive)
+    start = datetime.fromisoformat(day_str).replace(tzinfo=timezone.utc)
+    before = start + timedelta(days=1)
+    return start.isoformat().replace("+00:00","Z"), before.isoformat().replace("+00:00","Z")
 
 Q = """
-query($start: DateTime!, $end: DateTime!) {
-  posts(postedAfter: $start, postedBefore: $end, first: 100, order: VOTES_COUNT) {
+query($after: DateTime!, $before: DateTime!, $first: Int!, $cursor: String) {
+  posts(postedAfter: $after, postedBefore: $before, first: $first, after: $cursor) {
     edges {
       node {
-        id
-        name
-        tagline
-        votesCount
-        createdAt
-        website
+        id name tagline votesCount createdAt website slug
         makers { name username }
       }
     }
+    pageInfo { endCursor hasNextPage }
   }
 }
 """
 
-def fetch_ph(start: str, end: str):
+def fetch_day(day_str: str):
     if not PH_TOKEN:
-        raise HTTPException(500, "PRODUCTHUNT_TOKEN is not set on the server")
-    r = requests.post(
-        "https://api.producthunt.com/v2/api/graphql",
-        headers={"Authorization": f"Bearer {PH_TOKEN}", "Content-Type": "application/json"},
-        json={"query": Q, "variables": {"start": f"{start}T00:00:00Z", "end": f"{end}T23:59:59Z"}}
-    )
-    if not r.ok:
-        raise HTTPException(r.status_code, r.text)
-    data = r.json()
-    edges = data.get("data", {}).get("posts", {}).get("edges", [])
-    return [e["node"] for e in edges]
-
-app = FastAPI()
+        raise HTTPException(500, "PRODUCTHUNT_TOKEN is not set")
+    after, before = iso_day_bounds(day_str)
+    items, cursor = [], None
+    while True:
+        body = {"query": Q, "variables": {"after": after, "before": before, "first": 30, "cursor": cursor}}
+        r = requests.post(PH_URL, headers=HDRS, json=body, timeout=30)
+        if not r.ok:
+            raise HTTPException(r.status_code, r.text)
+        data = r.json().get("data", {}).get("posts", {})
+        items += [e["node"] for e in data.get("edges", [])]
+        page = data.get("pageInfo") or {}
+        if not page.get("hasNextPage") or len(items) >= 100:
+            break
+        cursor = page.get("endCursor")
+    return items[:100]
 
 @app.get("/", response_class=HTMLResponse)
 def root():
-    return HTMLResponse("<html><body><h1>OK</h1><p>Use /ph?start=YYYY-MM-DD&end=YYYY-MM-DD&fmt=html|json</p></body></html>")
+    return HTMLResponse("OK<br>Use /ph?start=YYYY-MM-DD&end=YYYY-MM-DD&fmt=html|json")
 
 @app.get("/ph")
 def ph(start: str = Query(...), end: str | None = Query(None), fmt: str = Query("html")):
     end = end or start
-    items = fetch_ph(start, end)
+    # iterate days inclusive
+    start_d = datetime.fromisoformat(start).date()
+    end_d = datetime.fromisoformat(end).date()
+    day = start_d
+    all_items = []
+    while day <= end_d:
+        all_items += fetch_day(day.isoformat())
+        day += timedelta(days=1)
+
     if fmt == "json":
-        return JSONResponse(items)
+        return JSONResponse(all_items)
+
     rows = []
-    for p in items:
+    for p in all_items:
         makers = ", ".join([m["name"] for m in p.get("makers") or []])
         rows.append(f"""
           <tr>
